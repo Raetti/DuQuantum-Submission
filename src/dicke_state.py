@@ -83,6 +83,25 @@ def _lower_to_willow_gateset(circuit: cirq.Circuit, atol: float = 1e-12) -> cirq
     return cirq.Circuit(clean_ops, strategy=cirq.InsertStrategy.EARLIEST)
 
 
+def _cnot_adjacent(control: cirq.Qid, target: cirq.Qid) -> list[cirq.Operation]:
+    """CNOT between adjacent qubits decomposed into single unitaries and CZ."""
+    h = cirq.PhasedXZGate.from_matrix(cirq.unitary(cirq.H))
+    return [
+        h(target),
+        cirq.CZ(control, target),
+        h(target),
+    ]
+
+
+def _swap_adjacent(q1: cirq.Qid, q2: cirq.Qid) -> list[cirq.Operation]:
+    """SWAP between adjacent qubits decomposed into single unitaries and CZs."""
+    return [
+        *_cnot_adjacent(q1, q2),
+        *_cnot_adjacent(q2, q1),
+        *_cnot_adjacent(q1, q2),
+    ]
+
+
 def _givens_rotation_circuit(
     control: cirq.GridQubit,
     target: cirq.GridQubit,
@@ -91,38 +110,13 @@ def _givens_rotation_circuit(
     """Decompose an excitation-preserving Givens rotation into native Willow gates."""
     ops: list[cirq.Operation] = []
 
-    def cnot(c: cirq.GridQubit, t: cirq.GridQubit):
-        return [
-            cirq.PhasedXZGate.from_matrix(cirq.unitary(cirq.H))(t),
-            cirq.CZ(c, t),
-            cirq.PhasedXZGate.from_matrix(cirq.unitary(cirq.H))(t),
-        ]
-
-    ops.extend(cnot(target, control))
+    ops.extend(_cnot_adjacent(target, control))
     ops.append(cirq.PhasedXZGate.from_matrix(cirq.unitary(cirq.ry(theta)))(target))
-    ops.extend(cnot(control, target))
+    ops.extend(_cnot_adjacent(control, target))
     ops.append(cirq.PhasedXZGate.from_matrix(cirq.unitary(cirq.ry(-theta)))(target))
-    ops.extend(cnot(control, target))
-    ops.extend(cnot(target, control))
+    ops.extend(_cnot_adjacent(control, target))
+    ops.extend(_cnot_adjacent(target, control))
     return ops
-
-
-def _cnot_adjacent(control: cirq.GridQubit, target: cirq.GridQubit) -> list[cirq.Operation]:
-    """CNOT between adjacent qubits decomposed into CZ and PhasedXZ."""
-    return [
-        cirq.PhasedXZGate.from_matrix(cirq.unitary(cirq.H))(target),
-        cirq.CZ(control, target),
-        cirq.PhasedXZGate.from_matrix(cirq.unitary(cirq.H))(target),
-    ]
-
-
-def _swap_adjacent(q1: cirq.GridQubit, q2: cirq.GridQubit) -> list[cirq.Operation]:
-    """SWAP between adjacent qubits decomposed into 3 CZs."""
-    return [
-        *_cnot_adjacent(q1, q2),
-        *_cnot_adjacent(q2, q1),
-        *_cnot_adjacent(q1, q2),
-    ]
 
 
 def _u_be_conquer(wires: Sequence[cirq.Qid], k: int) -> cirq.Circuit:
@@ -141,9 +135,9 @@ def _u_be_conquer(wires: Sequence[cirq.Qid], k: int) -> cirq.Circuit:
             rem = m - i
             theta = 2.0 * math.acos(math.sqrt((rem - 1.0) / rem))
             c.append(cirq.ry(theta / 2.0)(wires[i + 1]))
-            c.append(cirq.CNOT(wires[i], wires[i + 1]))
+            c.append(_cnot_adjacent(wires[i], wires[i + 1]))
             c.append(cirq.ry(-theta / 2.0)(wires[i + 1]))
-            c.append(cirq.CNOT(wires[i + 1], wires[i]))
+            c.append(_cnot_adjacent(wires[i + 1], wires[i]))
         return c
 
     k_eff = min(k, m - 1)
@@ -151,10 +145,10 @@ def _u_be_conquer(wires: Sequence[cirq.Qid], k: int) -> cirq.Circuit:
     c.append(
         [
             cirq.ry(math.pi / 2.0)(wires[1]),
-            cirq.CNOT(wires[1], wires[0]),
+            *_cnot_adjacent(wires[1], wires[0]),
             cirq.ry(t1 / 2.0)(wires[0]),
             cirq.ry(t1 / 2.0)(wires[1]),
-            cirq.CNOT(wires[1], wires[0]),
+            *_cnot_adjacent(wires[1], wires[0]),
             cirq.ry(-math.pi / 2.0)(wires[1]),
         ]
     )
@@ -164,22 +158,22 @@ def _u_be_conquer(wires: Sequence[cirq.Qid], k: int) -> cirq.Circuit:
         # Four of the nine naive CNOTs cancel via CNOT(b,c) * SWAP(b,c) = CNOT(c,b) * CNOT(b,c).
         c.append(
             [
-                cirq.CNOT(w_b, w_c),
+                *_cnot_adjacent(w_b, w_c),
                 cirq.ry(-tl / 4.0)(w_b),
-                cirq.CNOT(w_a, w_b),
+                *_cnot_adjacent(w_a, w_b),
                 cirq.ry(tl / 4.0)(w_b),
-                cirq.CNOT(w_c, w_b),
+                *_cnot_adjacent(w_c, w_b),
                 cirq.ry(-tl / 4.0)(w_b),
-                cirq.CNOT(w_a, w_b),
+                *_cnot_adjacent(w_a, w_b),
                 cirq.ry(tl / 4.0)(w_b),
-                cirq.CNOT(w_b, w_c),
+                *_cnot_adjacent(w_b, w_c),
             ]
         )
 
     if k_eff < m - 1:
         for pos in range(k_eff, m - 1):
-            c.append(cirq.CNOT(wires[pos], wires[pos + 1]))
-            c.append(cirq.CNOT(wires[pos + 1], wires[pos]))
+            c.append(_cnot_adjacent(wires[pos], wires[pos + 1]))
+            c.append(_cnot_adjacent(wires[pos + 1], wires[pos]))
 
     next_k = min(k, m - 1)
     # Preserve |11> -> |11> when recursing to m-1 == 2 inside a k >= 2 block.
@@ -202,8 +196,8 @@ def _u_padded_top_conquer(wires: Sequence[cirq.Qid], k: int) -> cirq.Circuit:
     # Shift each |0>-initialized wire at wires[:m-k] across the k active wires using 2-CNOT adjacent swaps.
     for idx in range(m - k - 1, -1, -1):
         for pos in range(idx, idx + k):
-            c.append(cirq.CNOT(wires[pos + 1], wires[pos]))
-            c.append(cirq.CNOT(wires[pos], wires[pos + 1]))
+            c.append(_cnot_adjacent(wires[pos + 1], wires[pos]))
+            c.append(_cnot_adjacent(wires[pos], wires[pos + 1]))
     c.append(_u_be_conquer(wires, k))
     return c
 
@@ -253,12 +247,12 @@ def _build_ladder_dicke(
         if suffix[i] > 0:
             phi = 2.0 * math.acos(math.sqrt(suffix[i + 1] / suffix[i]))
             c.append(cirq.ry(phi / 2.0)(upper[i]))
-            c.append(cirq.CNOT(upper[i - 1], upper[i]))
+            c.append(_cnot_adjacent(upper[i - 1], upper[i]))
             c.append(cirq.ry(-phi / 2.0)(upper[i]))
 
     for j in range(k):
         c.append(cirq.X(lower[k - 1 - j]))
-        c.append(cirq.CNOT(upper[j], lower[k - 1 - j]))
+        c.append(_cnot_adjacent(upper[j], lower[k - 1 - j]))
 
     c.append(_u_be_conquer(upper, k))
     c.append(_u_be_conquer(lower, k))
@@ -305,7 +299,7 @@ def _build_lnn_dicke(
     for i in range(1, k):
         phi = 2.0 * math.acos(math.sqrt(suffix[i + 1] / suffix[i]))
         c.append(cirq.ry(phi / 2.0)(u_active[i]))
-        c.append(cirq.CNOT(u_active[i - 1], u_active[i]))
+        c.append(_cnot_adjacent(u_active[i - 1], u_active[i]))
         c.append(cirq.ry(-phi / 2.0)(u_active[i]))
 
     for j in range(k):
@@ -313,19 +307,19 @@ def _build_lnn_dicke(
 
     if k == 2 and n1 == 2 and n2 == 2:
         # 9-CZ LNN fusion for (4,2): route CNOT(u0, l1) via a single CNOT(l0, l1) after CNOT(u1, l0).
-        c.append(cirq.CNOT(u_active[1], l_active[0]))
-        c.append(cirq.CNOT(l_active[0], l_active[1]))
-        c.append(cirq.SWAP(u_active[1], l_active[0]))
-        c.append(cirq.CNOT(l_active[0], l_active[1]))
-        c.append(cirq.SWAP(u_active[1], l_active[0]))
+        c.append(_cnot_adjacent(u_active[1], l_active[0]))
+        c.append(_cnot_adjacent(l_active[0], l_active[1]))
+        c.append(_swap_adjacent(u_active[1], l_active[0]))
+        c.append(_cnot_adjacent(l_active[0], l_active[1]))
+        c.append(_swap_adjacent(u_active[1], l_active[0]))
     else:
         for s in range(k):
             idx_a = n1 - 1 - s
             for pos in range(idx_a, idx_a + 2 * s + 1):
-                c.append(cirq.CNOT(qubits[pos], qubits[pos + 1]))
+                c.append(_cnot_adjacent(qubits[pos], qubits[pos + 1]))
             for pos in range(idx_a + 2 * s - 1, idx_a - 1, -1):
-                c.append(cirq.CNOT(qubits[pos], qubits[pos + 1]))
-                c.append(cirq.CNOT(qubits[pos + 1], qubits[pos]))
+                c.append(_cnot_adjacent(qubits[pos], qubits[pos + 1]))
+                c.append(_cnot_adjacent(qubits[pos + 1], qubits[pos]))
 
     c.append(_u_padded_top_conquer(upper_block, k))
     c.append(_u_be_conquer(lower_block, k))
