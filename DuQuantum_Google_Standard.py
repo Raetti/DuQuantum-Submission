@@ -19,6 +19,47 @@ import networkx as nx
 import numpy as np
 
 
+def _ensure_willow105() -> None:
+    """Attach Willow105 to cirq_google if running on stable cirq_google < 1.8.0.dev."""
+    if hasattr(cirq_google, "Willow105"):
+        return
+    try:
+        cirq_google.Willow105 = cirq_google.engine.create_device_from_processor_id("willow_pink")
+        return
+    except Exception:
+        pass
+    coords = [
+        (0, 6), (0, 7), (0, 8), (1, 5), (1, 6), (1, 7), (1, 8),
+        (2, 4), (2, 5), (2, 6), (2, 7), (2, 8), (2, 9), (2, 10),
+        (3, 3), (3, 4), (3, 5), (3, 6), (3, 7), (3, 8), (3, 9), (3, 10),
+        (4, 2), (4, 3), (4, 4), (4, 5), (4, 6), (4, 7), (4, 8), (4, 9), (4, 10), (4, 11), (4, 12),
+        (5, 1), (5, 2), (5, 3), (5, 4), (5, 5), (5, 6), (5, 7), (5, 8), (5, 9), (5, 10), (5, 11), (5, 12),
+        (6, 0), (6, 1), (6, 2), (6, 3), (6, 4), (6, 5), (6, 6), (6, 7), (6, 8), (6, 9), (6, 10), (6, 11), (6, 12), (6, 13), (6, 14),
+        (7, 2), (7, 3), (7, 4), (7, 5), (7, 6), (7, 7), (7, 8), (7, 9), (7, 10), (7, 11), (7, 12), (7, 13),
+        (8, 2), (8, 3), (8, 4), (8, 5), (8, 6), (8, 7), (8, 8), (8, 9), (8, 10), (8, 11), (8, 12),
+        (9, 4), (9, 5), (9, 6), (9, 7), (9, 8), (9, 9), (9, 10), (9, 11),
+        (10, 4), (10, 5), (10, 6), (10, 7), (10, 8), (10, 9), (10, 10),
+        (11, 6), (11, 7), (11, 8), (11, 9),
+        (12, 6), (12, 7), (12, 8),
+    ]
+    q_set = frozenset(cirq.GridQubit(r, c) for r, c in coords)
+    pairs = [
+        (q, nbr)
+        for q in sorted(q_set)
+        for nbr in sorted(q.neighbors())
+        if nbr > q and nbr in q_set
+    ]
+    gateset = cirq.Gateset(
+        cirq.CZ, cirq.PhasedXZGate, cirq.ResetChannel, cirq.MeasurementGate, cirq.WaitGate
+    )
+    cirq_google.Willow105 = cirq_google.devices.GridDevice._from_device_information(
+        qubit_pairs=pairs, gateset=gateset
+    )
+
+
+_ensure_willow105()
+
+
 def _to_phased_xz(op: cirq.Operation, atol: float = 1e-12) -> Optional[cirq.Operation]:
     if isinstance(op.gate, cirq.ResetChannel):
         return op
