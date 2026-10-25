@@ -1,6 +1,20 @@
 # DuQuantum 2026 — Google Quantum AI Dicke State Submission
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Raetti/DuQuantum-Submission/blob/main/DuQuantum_Google_Standard.ipynb)
+
 Divide-and-Conquer Dicke state preparation ($|D^{(N)}_n\rangle$) and calibration-aware 2D Ladder / 1D LNN grid selection for the Google `Willow105` superconducting processor.
+
+## Open in Google Colab (One-Click Verification)
+
+Click the **Open in Colab** badge above, or open the link directly:
+👉 **[Open DuQuantum_Google_Standard.ipynb in Colab](https://colab.research.google.com/github/Raetti/DuQuantum-Submission/blob/main/DuQuantum_Google_Standard.ipynb)**
+
+The notebook is pre-configured to:
+1. `!pip install cirq cirq-google` automatically in the first cell.
+2. Run noiseless statevector fidelity tests confirming $|\\langle D^{(N)}_n | \\psi \\rangle|^2 = 1.00000000$ across all $(N, n)$.
+3. Audit all operations to guarantee strictly native `cirq.CZ` and `cirq.PhasedXZGate` gates (0 CNOTs, 0 SWAPs).
+4. Simulate 2,000 projective Z-basis measurements confirming exact $\\frac{1}{\\binom{N}{n}}$ distribution with zero leakage.
+5. Simulate noisy density matrices to measure $\\langle D | \\rho | D \\rangle$ under depolarizing and thermal noise.
 
 ## Judge Submission Files
 
