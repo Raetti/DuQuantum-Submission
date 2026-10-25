@@ -891,6 +891,22 @@ def generate_two_qubit_pauli_error_rates(
     )
 
 
+def sample_benchmark_environment(rng: np.random.Generator = np.random.default_rng()):
+    """Produce a standard set of error rates for local testing, matching the challenge harness."""
+    dropouts = pick_single_qubit_dropouts(0.01, rng=rng)
+    sq_err = generate_qubit_error_rates(4e-4, 0.5, dropouts, 2e-4, rng=rng)
+    cz_err = generate_two_qubit_pauli_error_rates(single_qubit_dropouts=dropouts, rng=rng)
+    zero_err = generate_qubit_error_rates(5e-3, 0.5, dropouts, 2e-4, rng=rng)
+    one_err = generate_qubit_error_rates(1e-2, 0.5, dropouts, 3e-4, rng=rng)
+    return {
+        "dropouts": dropouts,
+        "sq_pauli_error_rate": sq_err,
+        "cz_pauli_error_rate": cz_err,
+        "zero_errors": zero_err,
+        "one_errors": one_err,
+    }
+
+
 def create_dicke_state_adaptive(
     num_qubits: int, num_excitations: int
 ) -> tuple[cirq.Circuit, set[cirq.GridQubit]]:
