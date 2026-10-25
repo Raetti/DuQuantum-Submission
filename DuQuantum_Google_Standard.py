@@ -5,8 +5,18 @@ Self-contained judge submission file implementing Divide-and-Conquer Dicke state
 preparation (Aktar, Bärtschi, Badawy, and Eidenbenz, arXiv:2112.12435) with
 calibration-aware 2D Ladder and 1D LNN grid selection on Google Willow105.
 
-Imports only cirq, cirq_google, their dependencies (numpy, networkx), and
-Python's standard library.
+High-Level Architecture:
+1. Hardware Gate Lowering:
+   Decomposes all multi-qubit interactions into native cirq.CZ and single-qubit
+   rotations into cirq.PhasedXZGate. Eliminates CNOTs/SWAPs via KAK synthesis.
+2. Divide-and-Conquer Synthesis:
+   - Divide: Unary cascade splits total excitation weight k across two subregisters.
+   - Conquer: Parallel U^{be} unitaries peel unary states into symmetric Dicke states.
+   - Topology: 2D Ladder (2xk core + 1D tails) for k >= 2; 1D LNN for k == 1.
+3. Calibration-Aware Grid Selection:
+   Precomputes exact template workloads once (CZ count, 1Q count, idle moments),
+   then evaluates physical Willow subgraphs using log-survival and Dicke-marginal
+   readout error rates in O(N) arithmetic.
 """
 
 import itertools
@@ -60,7 +70,13 @@ def _ensure_willow105() -> None:
 _ensure_willow105()
 
 
+# ==============================================================================
+# SECTION 1: Hardware Compilation & Native Willow Lowering
+# ==============================================================================
+
+
 def _to_phased_xz(op: cirq.Operation, atol: float = 1e-12) -> Optional[cirq.Operation]:
+    """Convert any single-qubit unitary to native cirq.PhasedXZGate; drop if identity."""
     if isinstance(op.gate, cirq.ResetChannel):
         return op
     u = cirq.unitary(op, None)
@@ -75,7 +91,11 @@ def _to_phased_xz(op: cirq.Operation, atol: float = 1e-12) -> Optional[cirq.Oper
 
 
 def _lower_to_willow_gateset(circuit: cirq.Circuit, atol: float = 1e-12) -> cirq.Circuit:
-    """Fuse adjacent 2Q blocks via KAK and merge 1Q gates into PhasedXZGate."""
+    """Lower circuit to native Willow gateset: cirq.CZ and cirq.PhasedXZGate.
+
+    Fuses adjacent 2Q unitaries via KAK decomposition into CZ gates, collapses
+    contiguous 1Q rotations into single PhasedXZGate ops, and repacks moments.
+    """
     merged_2q = cirq.merge_k_qubit_unitaries(
         circuit,
         k=2,
@@ -125,8 +145,13 @@ def _lower_to_willow_gateset(circuit: cirq.Circuit, atol: float = 1e-12) -> cirq
     return cirq.Circuit(clean_ops, strategy=cirq.InsertStrategy.EARLIEST)
 
 
+# ==============================================================================
+# SECTION 2: Divide-and-Conquer Circuit Builders (Aktar et al., 2021)
+# ==============================================================================
+
+
 def _cnot_adjacent(control: cirq.Qid, target: cirq.Qid) -> list[cirq.Operation]:
-    """CNOT between adjacent qubits decomposed into single unitaries and CZ."""
+    """Adjacent CNOT decomposed into single-qubit unitaries and CZ: (I x H) CZ (I x H)."""
     h = cirq.PhasedXZGate.from_matrix(cirq.unitary(cirq.H))
     return [
         h(target),
@@ -136,7 +161,7 @@ def _cnot_adjacent(control: cirq.Qid, target: cirq.Qid) -> list[cirq.Operation]:
 
 
 def _swap_adjacent(q1: cirq.Qid, q2: cirq.Qid) -> list[cirq.Operation]:
-    """SWAP between adjacent qubits decomposed into single unitaries and CZs."""
+    """Adjacent SWAP decomposed into 3 CZ-based CNOTs: CNOT(1,2) CNOT(2,1) CNOT(1,2)."""
     return [
         *_cnot_adjacent(q1, q2),
         *_cnot_adjacent(q2, q1),
@@ -145,12 +170,29 @@ def _swap_adjacent(q1: cirq.Qid, q2: cirq.Qid) -> list[cirq.Operation]:
 
 
 def _u_be_conquer(wires: Sequence[cirq.Qid], k: int) -> cirq.Circuit:
-    """Conquer unitary U^{be}_{m, k} (Figures 2 & 3 of Aktar et al., 2021)."""
+    """Conquer unitary U^{be}_{m, k} (Figures 2 & 3 of Aktar et al., 2021).
+
+    Transforms unary state |1^{k'} 0^{m-k'}> into Dicke state |D^{(m)}_{k'}>.
+
+    Pseudocode:
+      if m <= 1 or k <= 0: return empty
+      if k == 1:
+        # W-state: single excitation cascades along wire pairs via Givens rotations
+        for i in 0..m-2:
+          rotate wires[i+1] by theta/2, CNOT(i, i+1), rotate by -theta/2, CNOT(i+1, i)
+        return
+      # Multi-excitation (k >= 2):
+      1. l = 1 block on (wires[1], wires[0]) preserves |11> and rotates subspace
+      2. l = 2..k_eff blocks on (w_a, w_b, w_c): 4 of 9 CNOTs cancel algebraically
+      3. Shift peeled excitation rightward across remaining zero wires
+      4. Recurse: U^{be}_{m-1, next_k} on wires[:m-1]
+    """
     m = len(wires)
     c = cirq.Circuit()
     if m <= 1 or k <= 0:
         return c
 
+    # W-state branch: linear chain of 2-qubit excitation transfers
     if k == 1:
         for i in range(m - 1):
             rem = m - i
@@ -161,6 +203,7 @@ def _u_be_conquer(wires: Sequence[cirq.Qid], k: int) -> cirq.Circuit:
             c.append(_cnot_adjacent(wires[i + 1], wires[i]))
         return c
 
+    # Multi-excitation branch: peeling blocks
     k_eff = min(k, m - 1)
     t1 = 2.0 * math.acos(math.sqrt((m - 1.0) / m))
     c.append(
@@ -173,6 +216,7 @@ def _u_be_conquer(wires: Sequence[cirq.Qid], k: int) -> cirq.Circuit:
             cirq.ry(-math.pi / 2.0)(wires[1]),
         ]
     )
+    # Consecutive 3-qubit peeling blocks (5 CNOTs each via CNOT-SWAP cancellation)
     for l_idx in range(2, k_eff + 1):
         tl = 2.0 * math.acos(math.sqrt(float(l_idx) / m))
         w_a, w_b, w_c = wires[l_idx - 2], wires[l_idx - 1], wires[l_idx]
@@ -190,11 +234,13 @@ def _u_be_conquer(wires: Sequence[cirq.Qid], k: int) -> cirq.Circuit:
             ]
         )
 
+    # Shift excitation rightward through unused tail wires
     if k_eff < m - 1:
         for pos in range(k_eff, m - 1):
             c.append(_cnot_adjacent(wires[pos], wires[pos + 1]))
             c.append(_cnot_adjacent(wires[pos + 1], wires[pos]))
 
+    # Recurse on remaining m-1 wires; preserve |11> when recursing to m-1 == 2
     next_k = min(k, m - 1)
     if k >= 2 and m - 1 == 2:
         next_k = 2
@@ -203,7 +249,12 @@ def _u_be_conquer(wires: Sequence[cirq.Qid], k: int) -> cirq.Circuit:
 
 
 def _u_padded_top_conquer(wires: Sequence[cirq.Qid], k: int) -> cirq.Circuit:
-    """Conquer unitary U_{m, k} when wires[:m-k] are |0> and wires[m-k:] hold (q_1, ..., q_k)."""
+    """Conquer unitary for upper register with unexcited wires at wires[:m-k].
+
+    Pseudocode:
+      1. If k == 1: reverse wire order and peel right-to-left.
+      2. If k >= 2: shift each |0> wire past active wires via 2-CNOT swaps, then call U^{be}.
+    """
     m = len(wires)
     if m <= k or k <= 0:
         return _u_be_conquer(wires, k)
@@ -224,7 +275,16 @@ def _build_ladder_dicke(
     lower: Sequence[cirq.Qid],
     num_excitations: int,
 ) -> cirq.Circuit:
-    """Ladder Divide-and-Conquer Dicke circuit (Section III-B, Figure 4 of Aktar et al., 2021)."""
+    """Ladder Divide-and-Conquer Dicke circuit (Section III-B, Figure 4).
+
+    Pseudocode:
+      1. Particle-hole check: if n > N/2, solve for k = N - n, then bit-flip.
+      2. Divide Stage:
+         - Prepare superposition sum_i sqrt(binom(n1, i)*binom(n2, k-i)) on upper[0..k-1]
+         - Copy complementary bits to lower[0..k-1] via k parallel vertical CNOTs
+      3. Conquer Stage:
+         - Apply U^{be} on upper and lower registers in parallel moments.
+    """
     n1 = len(upper)
     n2 = len(lower)
     n_total = n1 + n2
@@ -235,16 +295,19 @@ def _build_ladder_dicke(
     if num_excitations == n_total:
         return _lower_to_willow_gateset(cirq.Circuit(cirq.X(q) for q in all_q))
 
+    # Exploit particle-hole bit-flip symmetry: D(N, n) = X^{\otimes N} D(N, N-n)
     invert = num_excitations > n_total // 2
     k = (n_total - num_excitations) if invert else num_excitations
 
     c = cirq.Circuit()
+    # Hypergeometric state amplitudes for partitioning k excitations across n1 and n2
     x_weights = [
         math.comb(n1, i) * math.comb(n2, k - i) if (i <= n1 and (k - i) <= n2) else 0
         for i in range(k + 1)
     ]
     suffix = [sum(x_weights[i:]) for i in range(k + 1)]
 
+    # Unary cascade on upper register
     if suffix[0] > 0:
         theta0 = 2.0 * math.acos(math.sqrt(x_weights[0] / suffix[0]))
         c.append(cirq.ry(theta0)(upper[0]))
@@ -256,10 +319,12 @@ def _build_ladder_dicke(
             c.append(_cnot_adjacent(upper[i - 1], upper[i]))
             c.append(cirq.ry(-phi / 2.0)(upper[i]))
 
+    # Complementary copy to lower register via vertical rungs
     for j in range(k):
         c.append(cirq.X(lower[k - 1 - j]))
         c.append(_cnot_adjacent(upper[j], lower[k - 1 - j]))
 
+    # Parallel Conquer on both subregisters
     c.append(_u_be_conquer(upper, k))
     c.append(_u_be_conquer(lower, k))
 
@@ -274,7 +339,11 @@ def _build_lnn_dicke(
     qubits: Sequence[cirq.Qid],
     num_excitations: int,
 ) -> cirq.Circuit:
-    """LNN Divide-and-Conquer Dicke circuit (Section III-C, Figures 5-6 of Aktar et al., 2021)."""
+    """LNN Divide-and-Conquer Dicke circuit (Section III-C, Figures 5-6).
+
+    Executes Divide-and-Conquer on a 1D chain by placing active Divide wires
+    across the midpoint boundary qubits[n1-k : n1+k].
+    """
     n_total = len(qubits)
     if num_excitations == 0:
         return cirq.Circuit()
@@ -296,6 +365,7 @@ def _build_lnn_dicke(
     ]
     suffix = [sum(x_weights[i:]) for i in range(k + 1)]
 
+    # Active Divide wires straddle the midpoint boundary
     u_active = qubits[n1 - k : n1]
     l_active = qubits[n1 : n1 + k]
 
@@ -311,6 +381,7 @@ def _build_lnn_dicke(
         c.append(cirq.X(l_active[j]))
 
     if k == 2 and n1 == 2 and n2 == 2:
+        # Optimized 9-CZ routing for (4,2)
         c.append(_cnot_adjacent(u_active[1], l_active[0]))
         c.append(_cnot_adjacent(l_active[0], l_active[1]))
         c.append(_swap_adjacent(u_active[1], l_active[0]))
@@ -335,10 +406,16 @@ def _build_lnn_dicke(
     return _lower_to_willow_gateset(c)
 
 
+# ==============================================================================
+# SECTION 3: Calibration-Aware Subgraph Selection & Scoring
+# ==============================================================================
+
+
 def _build_connectivity_graph(
     cz_pauli_error_rate: dict[tuple[cirq.GridQubit, cirq.GridQubit], tuple[float, float]],
     sq_pauli_error_rate: Optional[dict[cirq.GridQubit, tuple[float, float]]] = None,
 ) -> nx.Graph:
+    """Build NetworkX graph of working Willow qubits and bidirectional CZ couplers."""
     g = nx.Graph()
     if sq_pauli_error_rate:
         for q, (err, _) in sq_pauli_error_rate.items():
@@ -358,6 +435,14 @@ def _extract_template_workload(
     template: cirq.Circuit,
     abs_qubits: Sequence[cirq.Qid],
 ) -> tuple[list[tuple[int, int, int]], list[int], list[int], int]:
+    """Extract exact operation counts from an abstract template once before search.
+
+    Returns:
+      - edge_list: (i, j, cz_count) for every interacting wire pair
+      - sq_counts: number of single-qubit gates on each wire
+      - idle_moments: number of moments each wire is idle (depth - active)
+      - n_moments: total moment depth
+    """
     q_to_idx = {q: i for i, q in enumerate(abs_qubits)}
     n_q = len(abs_qubits)
     edge_counts: dict[tuple[int, int], int] = {}
@@ -398,6 +483,16 @@ def _build_calibration_costs(
     dict[cirq.GridQubit, float],
     dict[cirq.GridQubit, float],
 ]:
+    """Compute physics-based log-survival calibration weights.
+
+    Costs derived from log-survival probabilities w = -ln(1 - error):
+      - Couplers: w_cz = -ln(1 - e_cz)
+      - Single-qubit: w_1q = -ln(1 - e_1q)
+      - Readout: state-dependent marginal error e_ro = p0 * e_01 + p1 * e_10
+        where p1 = n/N (excitation fraction) and p0 = 1 - p1
+      - Idle: accounts for dephasing and T1 relaxation during idle moments
+      - Spectator: penalizes qubits adjacent to noisy unused couplers
+    """
     p1 = max(0.0, min(1.0, num_excitations / num_qubits)) if num_qubits > 0 else 0.25
     p0 = 1.0 - p1
 
@@ -444,6 +539,11 @@ def _score_physical_embedding(
     idle_rate: dict[cirq.GridQubit, float],
     spectator_cost: dict[cirq.GridQubit, float],
 ) -> float:
+    """Evaluate candidate physical placement in O(N) arithmetic without building Cirq objects.
+
+    Cost = sum_{(i,j)} m_{ij} * w_cz(pi(i), pi(j))
+         + sum_i [ s_i * w_1q + 0.08 * w_ro + I_i * gamma_idle + w_spec ]
+    """
     cost = 0.0
     for i0, i1, mult in edge_list:
         cost += mult * edge_cost.get((phys_qubits[i0], phys_qubits[i1]), 1.0)
@@ -471,6 +571,14 @@ def _find_best_ladder_embedding(
     one_errors: dict[cirq.GridQubit, tuple[float, float]],
     num_excitations: int,
 ) -> Optional[tuple[cirq.Circuit, set[cirq.GridQubit], float]]:
+    """Find the optimal 2D ladder embedding on Willow for k >= 2.
+
+    Search algorithm:
+      1. Find all valid 2xk rectangular core subgraphs (requires k vertical rungs).
+      2. Extend tails of length n1 - k and n2 - k from core endpoints using greedy DFS.
+      3. Score every complete candidate with _score_physical_embedding in O(N).
+      4. Materialize and return only the best candidate circuit.
+    """
     abs_upper = [cirq.LineQubit(i) for i in range(n1)]
     abs_lower = [cirq.LineQubit(n1 + i) for i in range(n2)]
     abs_all = abs_upper + abs_lower
@@ -601,6 +709,14 @@ def _find_best_lnn_embedding(
     zero_errors: dict[cirq.GridQubit, tuple[float, float]],
     one_errors: dict[cirq.GridQubit, tuple[float, float]],
 ) -> tuple[cirq.Circuit, set[cirq.GridQubit], float]:
+    """Find the lowest-error linear nearest-neighbor (LNN) chain on Willow.
+
+    Search algorithm:
+      1. Rank start nodes by single-qubit, readout, and incident coupler quality.
+      2. Run bounded DFS from top candidate roots with max_evals prune (< 1.5s runtime).
+      3. For every completed path, test both forward and reversed orientations to
+         place the quietest qubit on the wire that idles the longest.
+    """
     abs_q = [cirq.LineQubit(i) for i in range(num_qubits)]
     template = _build_lnn_dicke(abs_q, num_excitations)
     edge_list, sq_counts, idle_moments, n_moments = _extract_template_workload(template, abs_q)
@@ -679,6 +795,11 @@ def _find_best_lnn_embedding(
     return mapped, set(best_chain), best_score
 
 
+# ==============================================================================
+# SECTION 4: Public Submission Entry Points
+# ==============================================================================
+
+
 def create_dicke_state(
     num_qubits: int,
     num_excitations: int,
@@ -689,7 +810,13 @@ def create_dicke_state(
     zero_errors: dict[cirq.GridQubit, tuple[float, float]],
     one_errors: dict[cirq.GridQubit, tuple[float, float]],
 ) -> tuple[cirq.Circuit, set[cirq.GridQubit]]:
-    """Create a Cirq circuit that produces a Dicke state.
+    """Create a Cirq circuit that produces an N-qubit, weight-n Dicke state.
+
+    Algorithm selection:
+      1. If k == 0 (n=0 or n=N): pick lowest-error qubits; return |0...0> or X^{xN}.
+      2. If k >= 2 and N >= 4: attempt 2D Ladder embedding (_find_best_ladder_embedding).
+         Embeds 2xk core + tails on Willow's grid for parallel Conquer without SWAPs.
+      3. If k == 1 or Ladder unavailable: fall back to 1D LNN (_find_best_lnn_embedding).
 
     Args:
         num_qubits: The number, N, of qubits in the Dicke state.
@@ -775,7 +902,13 @@ def create_dicke_state(
     return best_circuit, best_qubits
 
 
+# ==============================================================================
+# SECTION 5: Official Challenge Verification & Scoring Functions
+# ==============================================================================
+
+
 def create_dicke_statevector(num_qubits: int, num_excitations: int) -> np.ndarray:
+    """Generate ideal theoretical statevector with equal weights across all binom(N, n) basis states."""
     psi = np.zeros(2**num_qubits)
     normalization = 1 / np.sqrt(math.comb(num_qubits, num_excitations))
     qubits = range(num_qubits)
@@ -791,6 +924,7 @@ def test_circuit(
     qubits: set[cirq.GridQubit],
     sampler=cirq.Simulator(),
 ):
+    """Verify exact statevector fidelity |<D|psi>|^2 == 1.0 on specified qubits."""
     all_qubits = circuit.all_qubits()
     ancilla_qubits = all_qubits.difference(qubits)
     ordered_qubits = sorted(qubits) + sorted(ancilla_qubits)
@@ -985,6 +1119,7 @@ def validate_circuit(
 
 
 def score_solution() -> float:
+    """Official challenge score: sum_{N, n} (N * n) / len(circuit) across N=2..20."""
     score = 0.0
     for num_qubits in range(2, 21):
         for num_excitations in range(1, num_qubits // 2 + 1):
